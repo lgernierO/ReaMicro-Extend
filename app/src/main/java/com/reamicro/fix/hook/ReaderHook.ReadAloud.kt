@@ -904,15 +904,11 @@ internal fun ReaderHook.buildReadAloudSegments(
     maxSegments: Int = MAX_READ_ALOUD_SEGMENTS,
     currentFileOnly: Boolean = false,
 ): List<ReadAloudSegment> {
-    val key = bookKey(context)
     val startChapterIndex = currentPageRef?.get()
         ?.let { callNoArg(it, "getChapterIndex") as? Number }
         ?.toInt()
         ?: -1
-    val cached = searchIndexState
-        ?.takeIf { it.bookKey == key && !currentFileOnly }
-        ?.documents
-    val documents = cached ?: buildReadAloudDocuments(context, maxSegments, currentFileOnly)
+    val documents = buildReadAloudDocuments(context, maxSegments, currentFileOnly)
     val filtered = if (currentFileOnly) {
         documents
     } else if (startChapterIndex >= 0) {
@@ -1010,15 +1006,7 @@ internal fun ReaderHook.buildReadAloudSegmentsFromSelection(
     maxSegments: Int = MAX_READ_ALOUD_SEGMENTS,
     currentFileOnly: Boolean = false,
 ): List<ReadAloudSegment> {
-    val key = bookKey(context)
-    val documents = if (currentFileOnly) {
-        buildReadAloudDocuments(context, maxSegments, currentFileOnly = true)
-    } else {
-        searchIndexState
-            ?.takeIf { it.bookKey == key }
-            ?.documents
-            ?: buildReadAloudDocuments(context, maxSegments, currentFileOnly = false)
-    }
+    val documents = buildReadAloudDocuments(context, maxSegments, currentFileOnly)
     if (documents.isEmpty()) {
         return selection.quote.takeIf { it.isNotBlank() }?.let {
             listOf(

@@ -28,6 +28,12 @@ internal class ReaderSearchBarPlacement {
     }
 
     companion object {
+        fun hostInset(system: Int, safeAreaPx: Float, contentInsetPx: Float): Int {
+            val host = maxOf(safeAreaPx.takeIf { it.isFinite() && it > 0 } ?: 0f,
+                contentInsetPx.takeIf { it.isFinite() && it > 0 } ?: 0f)
+            return maxOf(system.coerceAtLeast(0), kotlin.math.ceil(host.toDouble()).toInt())
+        }
+
         fun bounds(
             width: Int, height: Int, barWidth: Int, barHeight: Int,
             leftInset: Int, topInset: Int, rightInset: Int, bottomInset: Int, margin: Float,

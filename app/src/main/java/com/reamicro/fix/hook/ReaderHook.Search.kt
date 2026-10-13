@@ -47,7 +47,6 @@ internal fun ReaderHook.hasFullTextSearchState(): Boolean =
         lastCatalogContext != null ||
         lastSearchState != null ||
         activeSearchNavigation != null ||
-        searchIndexState != null ||
         searchDocumentCache.isNotEmpty() ||
         searchPageDialogRef?.get() != null ||
         searchNavigationBarRef?.get() != null
@@ -58,9 +57,10 @@ internal fun ReaderHook.resetFullTextSearchState(reason: String, removeOverlays:
     currentSearchPagerMode = null
     searchNavigator?.cancel()
     searchNavigator = null
-    searchScrollBridge?.clearCache()
     searchDocumentCache.clear()
+    hostFullTextBridge?.clearCache()
     currentScrollElement = null
+    currentViewModelRef?.get()?.let { hostFullTextBridge?.clearNavigation(it) }
     searchStateGeneration += 1
     searchRunSeq += 1
     activeSearchPageToken = 0L
@@ -75,7 +75,6 @@ internal fun ReaderHook.resetFullTextSearchState(reason: String, removeOverlays:
     searchNavigationState = null
     pendingSearchReturnCaptures = 0
     activeSearchNavigation = null
-    searchIndexState = null
     if (removeOverlays) {
         activityProvider()?.runOnUiThread {
             closeSearchPage()
@@ -344,16 +343,17 @@ internal fun ReaderHook.returnToSearchOrigin(
         clearStaleSearchNavigation()
         return
     }
-    // 先结束搜索并释放索引，再让宿主加载原章节；清掉持久化标记以阻止重入恢复。
+
     cancelSearchPageWork()
     searchDocumentCache.clear()
-    searchIndexState = null
+    hostFullTextBridge?.clearCache()
     val previousState = searchNavigationState
     activeSearchNavigation = null
     clearPersistedSearchOrigin()
     clearHostSearchJump()
     pendingSearchReturnCaptures = 0
     clearSearchResultHighlight()
+    currentViewModelRef?.get()?.let { hostFullTextBridge?.clearNavigation(it) }
     val target = navigation.returnTarget
     val jumped = runCatching {
         jumpToSearchCfi(
@@ -432,12 +432,13 @@ internal fun ReaderHook.isSearchNavigationCurrent(navigation: SearchNavigationSt
     searchNavigationState?.bookKey == navigation.bookKey
 
 internal fun ReaderHook.clearStaleSearchNavigation() {
+    currentViewModelRef?.get()?.let { hostFullTextBridge?.clearNavigation(it) }
     searchNavigator?.cancel()
     val owned = activeSearchNavigation != null || searchNavigationState != null
     if (owned) {
         cancelSearchPageWork()
         searchDocumentCache.clear()
-        searchIndexState = null
+    hostFullTextBridge?.clearCache()
     }
     activeSearchNavigation = null
     searchNavigationState = null

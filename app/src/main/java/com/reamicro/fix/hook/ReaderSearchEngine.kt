@@ -10,9 +10,10 @@ internal fun ReaderHook.searchFullTextStreaming(
     onUpdate: (List<FullTextSearchResult>, Boolean) -> Unit,
 ) {
 
-    fun current() = !Thread.currentThread().isInterrupted && request.acceptsSearch(searchStateGeneration, searchRunSeq)
+    val searchOwner = currentEpubStrong ?: currentEpubRef?.get()
+    fun current() = !Thread.currentThread().isInterrupted && request.acceptsSearch(searchStateGeneration, searchRunSeq) &&
+        (currentEpubStrong ?: currentEpubRef?.get()) === searchOwner
     if (!current()) return
-    val key = bookKey(context)
     if (keyword.isBlank()) { onUpdate(emptyList(), true); return }
     val results = ArrayList<FullTextSearchResult>()
     val throttle = SearchUpdateThrottle(SEARCH_EMIT_INTERVAL_MS)
@@ -22,103 +23,42 @@ internal fun ReaderHook.searchFullTextStreaming(
             onUpdate(ArrayList(results), done)
         }
     }
-    val cachedIndex = searchIndexState?.takeIf { it.bookKey == key && it.documents.all { document ->
-        document.file.lastModified() == document.sourceLastModified && document.file.length() == document.sourceLength
-    } }
-    if (cachedIndex != null) {
-        cachedIndex.completedQuery?.takeIf { it.keyword == keyword }?.let {
-            if (current()) onUpdate(it.resultsForReceiver(context.intentReceiver), true)
-            return
+    val epub = currentEpubStrong ?: currentEpubRef?.get() ?: error("阅读书籍不可用")
+    val root = currentEpubRoot() ?: error("正文目录不可用")
+    val epubTitlePaths = epubCatalogTitlePaths(root)
+    val bridge = hostFullTextBridge ?: HostFullTextBridge(this).also { hostFullTextBridge = it }
+    val items = (callNoArg(epub, "getItemRefs") as? List<*>).orEmpty()
+    for ((spine, item) in items.withIndex()) {
+        if (!current()) return
+        if (results.size >= MAX_SEARCH_RESULTS) break
+        item ?: continue
+        val file = searchFileForHref(root, callString(item, "getHref")) ?: continue
+        if (!file.isFile) continue
+        val modified = file.lastModified()
+        val length = file.length()
+        val blocks = bridge.blocks(epub, spine, file, ::current)
+        var countInFile = 0
+        for (block in blocks) {
+            if (!current() || results.size >= MAX_SEARCH_RESULTS || countInFile >= MAX_MATCHES_PER_FILE) break
+            val radius = if (block.text.any { it.code > 127 }) SEARCH_CJK_SNIPPET_RADIUS else SEARCH_SNIPPET_RADIUS
+            HostFullTextPolicy.forEachMatch(block.text, keyword, minOf(MAX_SEARCH_RESULTS - results.size,
+                MAX_MATCHES_PER_FILE - countInFile), ::current) { offset ->
+                val snippet = searchSnippet(block.text, offset, offset + keyword.length, radius + SEARCH_SNIPPET_EXTRA_RADIUS)
+                results.add(FullTextSearchResult(
+                    chapterIndex = block.chapterIndex, chapter = null, chapterTitle = block.chapterTitle,
+                    intentReceiver = context.intentReceiver, startCfi = null, cfi = block.anchor, endCfi = null, file = file,
+                    snippet = snippet.text, snippetMatchStart = snippet.matchStart, snippetMatchEnd = snippet.matchEnd,
+                    matchText = block.text.substring(offset, offset + keyword.length),
+                    volumeTitle = epubTitlePaths.titlePathForFile(root, file).dropLast(1).joinToString(" / "),
+                    hostHit = HostSearchHit(block.anchor, block.textAnchor, offset, keyword.length),
+                    hostSourceModified = modified, hostSourceLength = length,
+                ))
+                countInFile++
+            }
         }
-        for (document in cachedIndex.documents) {
-            if (!current()) return
-            if (results.size >= MAX_SEARCH_RESULTS) break
-            val previousSize = results.size
-            appendSearchMatches(document, keyword, context, results, ::current)
-            if (results.size != previousSize) emit(done = false)
-        }
-        if (current()) searchIndexState = cachedIndex.copy(completedQuery = SearchState(key, keyword, results.toList()))
-        emit(done = true)
-        return
-    }
-    if (current()) searchIndexState = null
-
-    val documents = ArrayList<SearchDocument>()
-    val indexBudget = SearchIndexBudget()
-    var complete = true
-    forEachSearchDocument(context, shouldContinue = ::current) { document ->
-        if (!current()) { complete = false; return@forEachSearchDocument false }
-        if (results.size < MAX_SEARCH_RESULTS) {
-            val previousSize = results.size
-            appendSearchMatches(document, keyword, context, results, ::current)
-            if (results.size != previousSize) emit(done = false)
-        }
-        // 整书索引不能绕过 LRU 的内存上限；超预算后仅继续流式匹配，不再保留章节。
-        if (indexBudget.retain(document.searchMemoryWeight())) documents.add(document) else documents.clear()
-        if (results.size >= MAX_SEARCH_RESULTS) { complete = false; false } else true
-    }
-    if (complete && indexBudget.cacheable && current() && bookKey(context) == key) {
-        searchIndexState = SearchIndexState(key, documents, SearchState(key, keyword, results.toList()))
+        emit(done = false)
     }
     emit(done = true)
-}
-
-internal fun ReaderHook.appendSearchMatches(
-    document: SearchDocument,
-    keyword: String,
-    context: CatalogContext,
-    results: ArrayList<FullTextSearchResult>,
-    current: () -> Boolean,
-) {
-    if (keyword.isEmpty() || !current()) return
-    var from = document.text.indexOf(keyword, ignoreCase = true)
-    if (from < 0) return
-    var countInFile = 0
-    val radius = (if (document.text.any { it.code > 127 }) SEARCH_CJK_SNIPPET_RADIUS else SEARCH_SNIPPET_RADIUS) + SEARCH_SNIPPET_EXTRA_RADIUS
-    while (results.size < MAX_SEARCH_RESULTS && countInFile < MAX_MATCHES_PER_FILE) {
-        if (!current()) return
-        val index = document.text.indexOf(keyword, from, ignoreCase = true)
-        if (index < 0) break
-        val snippet = searchSnippet(document.text, index, index + keyword.length, radius)
-        val chapterAnchor = document.chapterAnchors.lastOrNull { it.textStart <= index }
-        val resultChapter = chapterAnchor?.chapter ?: document.chapter
-        val resultChapterIndex = chapterAnchor?.index ?: document.chapterIndex
-        val resultChapterTitle = chapterAnchor?.title ?: document.chapterTitle
-        val titles = ReaderSearchPresentation.titles(
-            chapterAnchor?.titleParts ?: document.titleParts,
-            resultChapter?.let { catalogChapterTitle(it).normalizeChapterTitle() }.orEmpty()
-                .ifBlank { document.readAloudChapterTitle },
-            document.file.nameWithoutExtension,
-        )
-        val startCfi = document.indexedText.cfiAt(index)
-        val cfi = startCfi
-        val endCfi = document.indexedText.cfiAtBoundary(index + keyword.length)
-        if (startCfi == null || cfi == null || endCfi == null) {
-            from = index + keyword.length
-            continue
-        }
-        results.add(
-            FullTextSearchResult(
-                chapterIndex = resultChapterIndex,
-                chapter = resultChapter,
-                chapterTitle = resultChapterTitle,
-                intentReceiver = context.intentReceiver,
-                startCfi = startCfi,
-                cfi = cfi,
-                endCfi = endCfi,
-                file = document.file,
-                snippet = snippet.text,
-                snippetMatchStart = snippet.matchStart,
-                snippetMatchEnd = snippet.matchEnd,
-                matchText = document.text.substring(index, (index + keyword.length).coerceAtMost(document.text.length)),
-                sourceDigest = document.indexedText.sourceDigest,
-                volumeTitle = titles.volume,
-                displayChapterTitle = titles.chapter,
-            ),
-        )
-        countInFile++
-        from = index + keyword.length.coerceAtLeast(1)
-    }
 }
 
 internal fun ReaderHook.forEachSearchDocument(

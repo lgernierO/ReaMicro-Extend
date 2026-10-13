@@ -62,10 +62,20 @@ internal class ReaderSearchNavigationBar(val activity: Activity, private val rea
         val safe = windowInsets.getInsets(
             WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout() or WindowInsetsCompat.Type.ime()
         )
-        // 手势区允许贴底；三键导航、横屏刘海和键盘仍需避让。
-        val bottom = windowInsets.getInsets(WindowInsetsCompat.Type.tappableElement() or
-            WindowInsetsCompat.Type.displayCutout() or WindowInsetsCompat.Type.ime()).bottom
-        return Insets.of(safe.left, safe.top, safe.right, bottom)
+        val host = runCatching {
+            val window = reader.classLoader.loadClass("org.epub.UIEpubWindow").getField("INSTANCE").get(null)
+            val px = window.javaClass.getMethod("px", Number::class.java)
+            fun toPx(getter: String): Float {
+                val value = reader.callNoArg(window, getter) as Number
+                return (px.invoke(window, value) as Number).toFloat()
+            }
+            val boundary = reader.callNoArg(window, "getContentBoundary")
+            val top = (reader.callNoArg(boundary, "getTop") as? Number)?.toFloat() ?: 0f
+            val bottom = (reader.callNoArg(boundary, "getBottom") as? Number)?.toFloat() ?: 0f
+            ReaderSearchBarPlacement.hostInset(safe.top, toPx("getSafeAreaTop"), top) to
+                ReaderSearchBarPlacement.hostInset(safe.bottom, toPx("getSafeAreaBottom"), bottom)
+        }.getOrNull()
+        return Insets.of(safe.left, host?.first ?: safe.top, safe.right, host?.second ?: safe.bottom)
     }
 
     private fun bounds(): ReaderSearchBarPlacement.Bounds? {

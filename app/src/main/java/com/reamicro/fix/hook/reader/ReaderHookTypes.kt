@@ -36,12 +36,6 @@ internal data class NativeSelectionPayload(
     val endCfi: String,
 )
 
-internal data class SearchIndexState(
-    val bookKey: String,
-    val documents: List<SearchDocument>,
-    val completedQuery: SearchState? = null,
-)
-
 internal data class SearchDocument(
     val file: File,
     val chapterIndex: Int,
@@ -211,6 +205,9 @@ internal data class FullTextSearchResult(
     val sourceDigest: String = "",
     val volumeTitle: String = "",
     val displayChapterTitle: String = chapterTitle,
+    val hostHit: com.reamicro.fix.hook.HostSearchHit? = null,
+    val hostSourceModified: Long = 0L,
+    val hostSourceLength: Long = 0L,
 )
 
 internal data class DictionaryDialogHandle(

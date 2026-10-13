@@ -529,6 +529,12 @@ class AccountCompletionController(
         }
         updateCachedUser(account)
         method1(session, "setToken", account.token)
+        val repository = userRepository(activity) ?: error("无法获取宿主账号服务")
+        val refresh = allMethods(repository.javaClass).firstOrNull {
+            it.name == "fetchUserInfo" && it.parameterTypes.size == 2 && it.parameterTypes[0] == String::class.java
+        } ?: error("宿主账号刷新接口不存在")
+
+        invokeSuspendMethod(refresh.apply { isAccessible = true }, repository, account.token)
     }
 
     private fun restoreFullSessionPreferences(session: Any, snapshot: SessionSnapshot) {
@@ -546,6 +552,9 @@ class AccountCompletionController(
         updatePreference(session, key(PREF_KEYS_CLASS, "getBUILD_IN_FONTS"), snapshot.builtInFonts)
         updatePreference(session, key(PREF_KEYS_CLASS, "getPADDING"), snapshot.padding)
         restoreReaderMargins(session, snapshot.readerMargins ?: ReaderMarginsSnapshot.fromJson(null, snapshot.padding))
+        snapshot.readerPreferences.preferenceValues().forEach { (getter, value) ->
+            optionalReaderPreferenceKey(getter)?.let { updatePreference(session, it, value) }
+        }
         updatePreference(session, key(PREF_KEYS_CLASS, "getONLY_NEXT_PAGE"), snapshot.onlyNextPage)
         updatePreference(session, key(PREF_KEYS_CLASS, "getVOLUME_KEY"), snapshot.volumeKey)
         updatePreference(session, key(PREF_KEYS_CLASS, "getTIME_BATTERY"), snapshot.timeBattery)
@@ -578,6 +587,9 @@ class AccountCompletionController(
             builtInFonts = readPreference(prefs, key(PREF_KEYS_CLASS, "getBUILD_IN_FONTS")) as? Boolean ?: false,
             padding = (readPreference(prefs, key(PREF_KEYS_CLASS, "getPADDING")) as? Number)?.toInt() ?: 0,
             readerMargins = captureReaderMargins(prefs),
+            readerPreferences = ReaderSessionPreferences.capture { getter ->
+                optionalReaderPreferenceKey(getter)?.let { readPreference(prefs, it) }
+            },
             onlyNextPage = readPreference(prefs, key(PREF_KEYS_CLASS, "getONLY_NEXT_PAGE")) as? Boolean ?: false,
             volumeKey = readPreference(prefs, key(PREF_KEYS_CLASS, "getVOLUME_KEY")) as? Boolean ?: false,
             timeBattery = readPreference(prefs, key(PREF_KEYS_CLASS, "getTIME_BATTERY")) as? Boolean ?: false,
@@ -592,6 +604,14 @@ class AccountCompletionController(
             aliyunAuth = readPreference(prefs, key(THIRD_PARTY_KEYS_CLASS, "getALIYUN_AUTH")) as? String ?: "",
             yun115Auth = readPreference(prefs, key(THIRD_PARTY_KEYS_CLASS, "getYUN115_AUTH")) as? String ?: "",
         )
+    }
+
+    private fun optionalReaderPreferenceKey(getter: String): Any? {
+        val keys = staticObject(PREF_KEYS_CLASS, "INSTANCE") ?: return null
+        val method = allMethods(keys.javaClass).firstOrNull {
+            it.name == getter && it.parameterTypes.isEmpty()
+        } ?: return null
+        return method.apply { isAccessible = true }.invoke(keys)
     }
 
     private fun captureReaderMargins(preferences: Any): ReaderMarginsSnapshot? {
@@ -614,7 +634,7 @@ class AccountCompletionController(
         val marginsClass = update.parameterTypes[0]
         val constructor = marginsClass.getDeclaredConstructor(*Array(6) { Integer.TYPE })
         val margins = constructor.apply { isAccessible = true }.newInstance(*snapshot.arguments())
-        // 使用宿主原子更新，避免旧快照恢复时继续沿用另一账号的独立边距。
+
         invokeSuspendMethod(update, session, margins)
     }
 
@@ -1981,6 +2001,7 @@ class AccountCompletionController(
         val builtInFonts: Boolean,
         val padding: Int,
         val readerMargins: ReaderMarginsSnapshot? = null,
+        val readerPreferences: ReaderSessionPreferences = ReaderSessionPreferences(),
         val onlyNextPage: Boolean,
         val volumeKey: Boolean,
         val timeBattery: Boolean,
@@ -2013,6 +2034,7 @@ class AccountCompletionController(
                 put("builtInFonts", builtInFonts)
                 put("padding", padding)
                 readerMargins?.let { put("readerMargins", it.toJson()) }
+                put("readerPreferences", readerPreferences.toJson())
                 put("onlyNextPage", onlyNextPage)
                 put("volumeKey", volumeKey)
                 put("timeBattery", timeBattery)
@@ -2097,6 +2119,7 @@ class AccountCompletionController(
                     embeddedFonts = source.optBoolean("embeddedFonts", true),
                     builtInFonts = source.optBoolean("builtInFonts", false),
                     padding = source.optInt("padding", 0),
+                    readerPreferences = ReaderSessionPreferences.fromJson(source.optJSONObject("readerPreferences")),
                     readerMargins = source.optJSONObject("readerMargins")?.let {
                         ReaderMarginsSnapshot.fromJson(it, source.optInt("padding", 0))
                     },

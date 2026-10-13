@@ -53,6 +53,7 @@ class ReaderHook(
     internal var searchPaintEpoch: ReaderSearchPaintEpoch? = null
     @Volatile internal var searchPaintUnavailable = false
     internal var searchNavigator: ReaderSearchNavigator? = null
+    @Volatile internal var hostFullTextBridge: HostFullTextBridge? = null
     @Volatile internal var searchSourceBuilder: HostSearchIndexBuilder? = null
     internal val searchDocumentCache = SearchDocumentCache()
     internal val searchWorker = LatestSearchWorker("ReaMicroFullTextSearch")
@@ -125,7 +126,6 @@ class ReaderHook(
     @Volatile internal var lastOnDemandPrefetchSpineKey: String = ""
 
     @Volatile internal var onDemandNormalizedHrefsCache: Pair<String, List<String>>? = null
-    @Volatile internal var searchIndexState: SearchIndexState? = null
     @Volatile internal var searchStateGeneration: Long = 0L
     @Volatile internal var searchRunSeq: Long = 0L
     @Volatile internal var searchInProgress = false
@@ -192,7 +192,7 @@ class ReaderHook(
         if (runningUnderPressure || level >= ComponentCallbacks2.TRIM_MEMORY_BACKGROUND) {
 
             searchDocumentCache.clear()
-            searchIndexState = null
+            hostFullTextBridge?.clearCache()
             cachedThemeColors = null
             readerSearchTheme = null
         }

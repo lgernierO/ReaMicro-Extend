@@ -145,7 +145,6 @@ internal fun ReaderHook.openAnchoredSelectionEditor() {
                                         ?.values.orEmpty().mapNotNull { it?.let { page -> callNoArg(page, "getDocument") } }
                                     captured.mapper.checkReadingDocuments(documents)
                                     EpubTextFiles.save(captured.file, updated, loaded.snapshot)
-                                    searchIndexState = null
                                     lastSearchState = null
                                 }
                                 activity.runOnUiThread {

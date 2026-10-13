@@ -45,6 +45,9 @@ class ReaderDialogueHighlightHook(
     private val settings: XposedModuleSettings,
 ) {
     private val hostCompat = HostReflect(classLoader)
+    private val runtimeToken = HighlightRuntimeToken()
+    private val themeRefreshCache = HighlightIdentityCache<Any, Any>(64, 262_144)
+    private val rememberedTextCache = HighlightIdentityCache<Any, Any>(64, 262_144)
     private val fontFamilyCache = HashMap<String, Any>()
     private val failedFontFamilyLogKeys = HashSet<String>()
     private val onlineParagraphCommentDebugKeys = HashSet<String>()
@@ -127,6 +130,7 @@ class ReaderDialogueHighlightHook(
             methods.forEach { method ->
                 XposedBridge.hookMethod(method, object : XC_MethodHook() {
                     override fun afterHookedMethod(param: MethodHookParam) {
+                        if (param.throwable != null) return
                         applyDialogueHighlight(param.thisObject)
                         applyOnlineParagraphComments(param.thisObject)
                     }
@@ -469,11 +473,17 @@ class ReaderDialogueHighlightHook(
     private fun refreshAnnotatedStringForCurrentTheme(annotatedString: Any?): Any? {
         checkHighlightRuntimeVersion()
         annotatedString ?: return null
-        if (hasCurrentReaderHighlightMarker(annotatedString) && settings.snapshot().canHighlightReaderDialogue) return null
-        val markerCount = highlightMarkerRanges(annotatedString).size
-        val rawNineRanges = ninePatchRanges(annotatedString)
-        if (markerCount == 0 && rawNineRanges.isEmpty() && !hasOwnedHighlightStyle(annotatedString)) return null
-        return highlightedAnnotatedString(annotatedString, contentDom = null)
+        val length = callNoArg(annotatedString, "getText")?.toString()?.length ?: 0
+        return themeRefreshCache.getOrCompute(annotatedString, currentHighlightRuntimeKey(), length) {
+            if (hasCurrentReaderHighlightMarker(annotatedString) && settings.snapshot().canHighlightReaderDialogue) {
+                null
+            } else {
+                val markerCount = highlightMarkerRanges(annotatedString).size
+                val rawNineRanges = ninePatchRanges(annotatedString)
+                if (markerCount == 0 && rawNineRanges.isEmpty() && !hasOwnedHighlightStyle(annotatedString)) null
+                else highlightedAnnotatedString(annotatedString, contentDom = null)
+            }
+        }
     }
 
     private fun highlightedAnnotatedString(original: Any, contentDom: Any?): Any? {
@@ -664,7 +674,7 @@ class ReaderDialogueHighlightHook(
         val previous = instanceMethod(element, "previousElementSibling", 0)
         val next = instanceMethod(element, "nextElementSibling", 0)
         if (previous != null && next != null) {
-            // 宿主维护兄弟下标并跳过非元素节点，无需每段复制、查找整份兄弟列表。
+
             val window = highlightParagraphWindow(element, radius, { previous.invoke(it) }, { next.invoke(it) })
             return DialogueParagraphContext(
                 window.elements.mapIndexed { index, sibling ->
@@ -1005,8 +1015,10 @@ class ReaderDialogueHighlightHook(
             methods.forEach { method ->
                 XposedBridge.hookMethod(method, object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: MethodHookParam) {
-                        refreshAnnotatedStringForCurrentTheme(param.args?.getOrNull(0))?.let { param.args[0] = it }
-                        compareJustifyTextForHighlight(param)
+                        refreshAnnotatedStringForCurrentTheme(param.args?.getOrNull(0))?.let {
+                            param.args[0] = it
+                            compareJustifyTextForHighlight(param)
+                        }
                         rememberNinePatchRanges(param.args?.getOrNull(0))
                     }
                 })
@@ -1020,7 +1032,7 @@ class ReaderDialogueHighlightHook(
 
     private fun compareJustifyTextForHighlight(param: XC_MethodHook.MethodHookParam) {
         val flags = param.args?.getOrNull(JUSTIFY_TEXT_CHANGED_FLAGS_INDEX) as? Int ?: return
-        // 参数可能被模块替换，交给宿主当前节点的 changed(text) 比较，不能每帧强制标脏。
+
         param.args[JUSTIFY_TEXT_CHANGED_FLAGS_INDEX] = flags and JUSTIFY_TEXT_TEXT_DIRTY_MASK.inv()
     }
 
@@ -1065,7 +1077,9 @@ class ReaderDialogueHighlightHook(
     }
 
     private fun clearHighlightRuntimeCaches() {
-        // 图片按资源路径和修改时间失效，切书或规则版本变化不必重复解码。
+        themeRefreshCache.clear()
+        rememberedTextCache.clear()
+
         synchronized(reedenBoxStyleCache) { reedenBoxStyleCache.clear() }
         synchronized(nineSliceCache) { nineSliceCache.clear() }
         synchronized(rememberedNinePatchRanges) { rememberedNinePatchRanges.clear() }
@@ -1108,7 +1122,7 @@ class ReaderDialogueHighlightHook(
             val layoutCache = nodeClass.declaredMethods.first {
                 it.name == "getLayoutCache" && it.parameterTypes.size == 1
             }.apply { isAccessible = true }
-            // 直接复用真实文本节点及其布局，不改 onTextLayout；回调变化会让宿主重新测量。
+
             XposedBridge.hookMethod(draw, object : XC_MethodHook() {
                 override fun beforeHookedMethod(param: MethodHookParam) {
                     runCatching {
@@ -1138,16 +1152,19 @@ class ReaderDialogueHighlightHook(
     private fun rememberNinePatchRanges(annotatedString: Any?) {
         checkHighlightRuntimeVersion()
         annotatedString ?: return
-        val ranges = currentNinePatchRanges(annotatedString)
-        if (ranges.isEmpty()) return
         val key = annotatedStringTextKey(annotatedString)
         if (key.isBlank()) return
-        synchronized(rememberedNinePatchRanges) {
-            if (rememberedNinePatchRanges[key]?.ranges == ranges) return
-        }
-        val normalized = normalizedTextWithSourceMap(key)
-        synchronized(rememberedNinePatchRanges) {
-            rememberedNinePatchRanges[key] = RememberedNinePatchText(key, ranges, normalized)
+        rememberedTextCache.getOrCompute(annotatedString, currentHighlightRuntimeKey(), key.length) {
+            val ranges = currentNinePatchRanges(annotatedString)
+            if (ranges.isNotEmpty()) {
+                val normalized = normalizedTextWithSourceMap(key)
+                synchronized(rememberedNinePatchRanges) {
+                    rememberedNinePatchRanges[key] = RememberedNinePatchText(key, ranges, normalized)
+                }
+
+                synchronized(derivedNinePatchRanges) { derivedNinePatchRanges.clear() }
+            }
+            null
         }
     }
 
@@ -1188,8 +1205,10 @@ class ReaderDialogueHighlightHook(
             if (end > start) exclusiveRange(start, end) else null
         }
 
-    private fun highlightMarkerToken(): String =
-        "${ReaderHighlightBookContext.bookKey}|${ReaderHighlightBookContext.version()}|${isNightMode()}|${settings.snapshot().canHighlightReaderDialogue}"
+    private fun highlightMarkerToken(): String = runtimeToken.get(
+        ReaderHighlightBookContext.bookKey, ReaderHighlightBookContext.version(),
+        isNightMode(), settings.snapshot().canHighlightReaderDialogue,
+    )
 
     private fun currentHighlightRuntimeKey(): String =
         lastHighlightRuntimeKey.ifBlank { highlightMarkerToken() }
@@ -1226,7 +1245,7 @@ class ReaderDialogueHighlightHook(
     ): List<NinePatchRange> {
         val original = source.normalized
         if (original.text.isBlank()) return emptyList()
-        val currentStartInOriginal = original.text.indexOf(current.text)
+        val currentStartInOriginal = uniqueHighlightTextOffset(original.text, current.text)
         if (currentStartInOriginal < 0) return emptyList()
         val currentEndInOriginal = currentStartInOriginal + current.text.length
         val mapped = source.ranges.mapNotNull { range ->
@@ -1291,32 +1310,48 @@ class ReaderDialogueHighlightHook(
         val density = activityProvider()?.resources?.displayMetrics?.density ?: 1f
         val rectsByRange = cachedLineRects(layout, density, state)
         state.ranges.forEachIndexed { index, range ->
-            val image = imageCache.get(range.path)
-            if (image == null) return@forEachIndexed
             val box = reedenBoxStyle(range.css, density)
-            val nineSlice = parseNineSlice(range.slice, image.bitmap.width, image.bitmap.height)
             val rects = rectsByRange.getOrNull(index).orEmpty()
+            var image: CachedImage? = null
+            var imageRequested = false
+            var nineSlice: NineSlice? = null
             rects.forEach { rect ->
-                val saveCount = if (box.radiusPx > 0f) {
-
-                    state.clipRectF.set(rect)
-                    state.clipPath.rewind()
-                    state.clipPath.addRoundRect(state.clipRectF, box.radiusPx, box.radiusPx, Path.Direction.CW)
-                    val count = canvas.save()
-                    canvas.clipPath(state.clipPath)
-                    count
-                } else {
-                    -1
+                state.visibleRect.set(rect)
+                if (box.borderWidthPx > 0f) {
+                    val border = kotlin.math.ceil(box.borderWidthPx.toDouble()).toInt()
+                    state.visibleRect.inset(-border, -border)
                 }
-                if (nineSlice != null) {
-                    drawNineSlice(canvas, image.bitmap, nineSlice, rect, state)
-                } else if (image.bitmap.ninePatchChunk == null) {
-                    drawBitmapByBackgroundSize(canvas, image.bitmap, rect, box.backgroundSize, state)
-                } else {
-                    image.drawable.bounds = rect
-                    image.drawable.draw(canvas)
+                if (canvas.quickReject(
+                        state.visibleRect.left.toFloat(), state.visibleRect.top.toFloat(),
+                        state.visibleRect.right.toFloat(), state.visibleRect.bottom.toFloat(),
+                        android.graphics.Canvas.EdgeType.AA,
+                    )) return@forEach
+                if (!imageRequested) {
+                    image = imageCache.get(range.path)
+                    imageRequested = true
+                    image?.let { nineSlice = parseNineSlice(range.slice, it.bitmap.width, it.bitmap.height) }
                 }
-                if (saveCount >= 0) canvas.restoreToCount(saveCount)
+                val ready = image ?: return@forEach
+                val saveCount = if (box.radiusPx > 0f) canvas.save() else -1
+                try {
+                    if (saveCount >= 0) {
+                        state.clipRectF.set(rect)
+                        state.clipPath.rewind()
+                        state.clipPath.addRoundRect(state.clipRectF, box.radiusPx, box.radiusPx, Path.Direction.CW)
+                        canvas.clipPath(state.clipPath)
+                    }
+                    val slice = nineSlice
+                    if (slice != null) {
+                        drawNineSlice(canvas, ready.bitmap, slice, rect, state)
+                    } else if (ready.bitmap.ninePatchChunk == null) {
+                        drawBitmapByBackgroundSize(canvas, ready.bitmap, rect, box.backgroundSize, state)
+                    } else {
+                        ready.drawable.bounds = rect
+                        ready.drawable.draw(canvas)
+                    }
+                } finally {
+                    if (saveCount >= 0) canvas.restoreToCount(saveCount)
+                }
                 drawCssBorder(canvas, rect, box, state)
             }
         }
@@ -1979,13 +2014,14 @@ class ReaderDialogueHighlightHook(
 
         val clipPath: Path = Path()
         val clipRectF: RectF = RectF()
-        // 可变绘制对象只由各自的文本节点在绘制线程复用。
+
         val srcX = IntArray(4)
         val srcY = IntArray(4)
         val dstX = IntArray(4)
         val dstY = IntArray(4)
         val sourceRect = Rect()
         val targetRect = Rect()
+        val visibleRect = Rect()
         val borderRect = RectF()
         val borderPaint = Paint(Paint.ANTI_ALIAS_FLAG)
     }

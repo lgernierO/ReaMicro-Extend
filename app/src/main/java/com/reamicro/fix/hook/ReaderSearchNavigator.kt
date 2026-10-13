@@ -6,7 +6,6 @@ import android.os.SystemClock
 import android.widget.Toast
 import com.reamicro.fix.hook.reader.*
 import com.reamicro.fix.xposed.XposedBridge
-import com.reamicro.fix.xposed.XposedHelpers
 import java.util.concurrent.FutureTask
 import java.util.concurrent.TimeUnit
 
@@ -30,10 +29,10 @@ internal class ReaderSearchNavigator(private val reader: ReaderHook) {
         deadline?.let(main::removeCallbacks)
         deadline = null
         worker.cancel()
+        reader.currentViewModelRef?.get()?.let { reader.hostFullTextBridge?.invalidateNavigation(it) }
         requestedIndex = null
         cursorIndex = null
         failedIndex = null
-        reader.searchScrollBridge?.clearCache()
     }
     fun submit(result: FullTextSearchResult, index: Int): Boolean {
         val vm = reader.currentViewModelRef?.get() ?: return false
@@ -44,6 +43,7 @@ internal class ReaderSearchNavigator(private val reader: ReaderHook) {
         requestedIndex = index
         cursorIndex = index
         failedIndex = null
+        reader.hostFullTextBridge?.invalidateNavigation(vm)
         val request = Request(result, index, book, reader.searchStateGeneration, vm, epub, mode)
         val ticket = worker.submit { ticket ->
             val work = Work(request, ticket)
@@ -60,6 +60,7 @@ internal class ReaderSearchNavigator(private val reader: ReaderHook) {
                 worker.cancel()
                 requestedIndex = null
                 failedIndex = index
+                reader.hostFullTextBridge?.clearNavigation(vm)
                 reader.clearHostSearchJump()
                 reader.activityProvider()?.let { reader.ensureSearchNavigationBar(it) }
             }
@@ -80,61 +81,33 @@ internal class ReaderSearchNavigator(private val reader: ReaderHook) {
     private fun navigate(work: Work) {
         val r = work.value
         val startedAt = SystemClock.elapsedRealtime()
+        Thread.sleep(60)
         if (!valid(r) || !work.ticket.isCurrent()) return
-        Thread.sleep(80)
-        if (!valid(r) || !work.ticket.isCurrent()) return
-        val loaded = onMain {
-            if (valid(r) && work.ticket.isCurrent()) reader.searchScrollBridge?.snapshot(r.vm) else null
-        }
-        // 解析器持有宿主 DOM 和排版对象，只在本次定位中保留，不跨跳转缓存整章。
-        val resolver = ReaderSearchResolver(reader)
-        val resolved = try {
-            resolver.resolve(r.result, r.index, r.vm, r.epub, loaded) { valid(r) && work.ticket.isCurrent() }
-        } finally { resolver.clear() }
-        XposedBridge.log("ReaMicro search resolved seq=${work.sequence} index=${r.index} ms=${SystemClock.elapsedRealtime() - startedAt}")
-        if (!dispatch(work, resolved)) return
-        val arrived = awaitPage(work, resolved)
+        val bridge = reader.hostFullTextBridge ?: error("宿主搜索桥接未初始化")
         onMain {
             if (!valid(r) || !work.ticket.isCurrent()) return@onMain
-            check(arrived) { "宿主未确认目标页，请重试或重新搜索" }
-            acknowledge(work, resolved)
-            XposedBridge.log("ReaMicro search navigation acknowledged seq=${work.sequence} index=${r.index} ranges=${resolved.ranges.size} ms=${SystemClock.elapsedRealtime() - startedAt}")
+            reader.cancelSelectionPagerConfirmation()
+            reader.clearSearchResultHighlight(r.vm)
+            reader.clearHostSearchJump()
+            reader.pendingSearchReturnCaptures = 0
+            bridge.open(r.vm, r.result, reader.searchNavigationState?.keyword.orEmpty())
         }
-    }
-    private fun dispatch(work: Work, resolved: ResolvedSearchTarget): Boolean = onMain {
-        val r = work.value
-        if (!valid(r) || !work.ticket.isCurrent()) return@onMain false
-        reader.cancelSelectionPagerConfirmation()
-
-        check(reader.showSearchReaderContent(r.vm)) { "无法关闭阅读菜单，请重新进入阅读页" }
-        reader.clearHostSearchJump()
-        reader.pendingSearchReturnCaptures = 0
-        if (visible(r.vm, resolved)) return@onMain true
-        if (resolved.flipStyle == 3 && reader.searchScrollBridge?.command(r.vm, resolved) != null) return@onMain true
-        val mark = reader.createSearchResultHighlightMark(resolved.result, r.index)
-        val anchor = resolved.scrollElementId ?: resolved.start
-        check(reader.jumpToSearchCfi(r.result.intentReceiver, r.vm, anchor.toString(), mark,
-            r.result.chapterIndex.coerceAtLeast(0), r.result.chapterTitle, r.result.snippet)) { "宿主未接受搜索跳转" }
-        XposedBridge.log("ReaMicro search navigation dispatched seq=${work.sequence} index=${r.index}")
-        true
-    }
-    private fun acknowledge(work: Work, resolved: ResolvedSearchTarget) {
-        val r = work.value
-        reader.pendingSearchReturnCaptures = 0
-        val mark = reader.createSearchResultHighlightMark(resolved.result, r.index) ?: error("命中范围无法绘制")
-        if (resolved.flipStyle != 3) reader.searchPageBridge?.page(r.vm)?.let { page ->
-
-            reader.currentPageRef = java.lang.ref.WeakReference(page)
-            reader.currentPageStrong = page
-            reader.currentScrollElement = null
+        var confirmed = false
+        while (valid(r) && work.ticket.isCurrent() && SystemClock.elapsedRealtime() - startedAt < 6000) {
+            confirmed = onMain { valid(r) && work.ticket.isCurrent() && bridge.confirmed(r.vm, r.result) }
+            if (confirmed) break
+            Thread.sleep(HostFullTextPolicy.pollDelay(SystemClock.elapsedRealtime() - startedAt))
         }
-        reader.applySearchResultHighlight(r.vm, mark, resolved.ranges, r.epub, r.generation)
-        if (!valid(r) || !work.ticket.isCurrent()) return
-        reader.activeSearchNavigation = reader.activeSearchNavigation?.copy(currentIndex = r.index)
-        reader.lastSearchState?.let { reader.activeSearchPageUpdate?.invoke(it, !it.complete) }
-        requestedIndex = null
-        failedIndex = null
-        reader.activityProvider()?.let { reader.ensureSearchNavigationBar(it) }
+        onMain {
+            if (!valid(r) || !work.ticket.isCurrent()) return@onMain
+            check(confirmed) { "宿主未确认搜索位置，请重试" }
+            reader.activeSearchNavigation = reader.activeSearchNavigation?.copy(currentIndex = r.index)
+            reader.lastSearchState?.let { reader.activeSearchPageUpdate?.invoke(it, !it.complete) }
+            requestedIndex = null
+            failedIndex = null
+            reader.activityProvider()?.let { reader.ensureSearchNavigationBar(it) }
+            XposedBridge.log("ReaMicro host search navigation index=${r.index} mode=${r.mode} ms=${SystemClock.elapsedRealtime() - startedAt}")
+        }
     }
     private fun fail(work: Work, error: Throwable) {
         val r = work.value
@@ -145,6 +118,7 @@ internal class ReaderSearchNavigator(private val reader: ReaderHook) {
             requestedIndex = null
             failedIndex = r.index
             reader.pendingSearchReturnCaptures = 0
+            reader.hostFullTextBridge?.clearNavigation(r.vm)
             reader.clearHostSearchJump()
             reader.clearSearchResultHighlight(r.vm)
             val cause = error.cause ?: error
@@ -161,50 +135,11 @@ internal class ReaderSearchNavigator(private val reader: ReaderHook) {
             deadline?.let(main::removeCallbacks)
             deadline = null
             if (requestedIndex == null) return@post
+            reader.hostFullTextBridge?.clearNavigation(work.value.vm)
+            reader.pendingSearchReturnCaptures = 0
             requestedIndex = null
             failedIndex = work.value.index
             reader.activityProvider()?.let { reader.ensureSearchNavigationBar(it) }
         }
-    }
-    private fun visible(vm: Any, target: ResolvedSearchTarget): Boolean = if (target.flipStyle == 3)
-        reader.searchScrollBridge?.visible(vm, target) == true else contains(reader.searchPageBridge?.page(vm), target.start)
-    private fun contains(page: Any?, cfi: Any): Boolean {
-        val range = page?.let { reader.callNoArg(it, "getRange") } ?: return false
-        return XposedHelpers.callMethod(range, "contains", cfi) == true
-    }
-    private fun awaitPage(work: Work, target: ResolvedSearchTarget): Boolean {
-        val r = work.value
-        val started = SystemClock.elapsedRealtime()
-        var absoluteSent = false
-        var scrollSent = false
-        while (valid(r) && work.ticket.isCurrent() && SystemClock.elapsedRealtime() - started < 6_000) {
-            if (target.flipStyle == 3 && !scrollSent && work.ticket.isCurrent()) {
-                val command = onMain { if (valid(r) && work.ticket.isCurrent()) reader.searchScrollBridge?.command(r.vm, target) else null }
-                if (command != null) {
-                    scrollSent = true
-                    reader.searchScrollBridge?.execute(command) { valid(r) && work.ticket.isCurrent() }
-                }
-            }
-            val state = onMain {
-                if (!valid(r) || !work.ticket.isCurrent()) return@onMain 2
-                if (visible(r.vm, target)) return@onMain 1
-                val seed = XposedHelpers.getObjectField(r.vm, "jumpSeed")?.let { reader.callNoArg(it, "getValue") }?.toString()
-                if (!absoluteSent && work.ticket.isCurrent() && seed == target.start.toString() &&
-                    target.flipStyle != null && target.flipStyle != 3 && SystemClock.elapsedRealtime() - started >= 200) {
-                    val pages = XposedHelpers.getObjectField(r.vm, "virtualPages") as? Map<*, *>
-                    val key = pages?.entries?.firstOrNull { contains(it.value, target.start) }?.key as? Number
-                    val progress = reader.callNoArg(r.vm, "getProgress")
-                    if (key != null && progress != null) {
-                        absoluteSent = true
-                        val sent = XposedHelpers.callMethod(progress, "tryEmit", key.toInt()) == true
-                        XposedBridge.log("ReaMicro search absolute page dispatch seq=${work.sequence} target=${key.toInt()} accepted=$sent")
-                    }
-                }
-                0
-            }
-            if (state != 0) return state == 1
-            Thread.sleep(60)
-        }
-        return false
     }
 }
